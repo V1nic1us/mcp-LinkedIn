@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a local Rust MCP server that helps AI clients prepare profile edits and publish personal LinkedIn text/link posts through the official API after explicit confirmation.
+**Goal:** Build a local Rust MCP server that helps AI clients prepare profile edits and publish personal LinkedIn text posts through the official API after explicit confirmation.
 
-**Architecture:** Start with an MCP stdio binary for Linux. Keep MCP tools, OAuth/token handling, and LinkedIn REST calls in separate modules. Profile assistance remains local text preparation plus an official edit-page link; publishing stays disabled until the LinkedIn app has the official Share on LinkedIn product and `w_member_social` permission.
+**Architecture:** Start with an MCP stdio binary for Linux. Keep MCP tools, OAuth/token handling, and LinkedIn REST calls in separate modules. Profile assistance remains local text preparation plus an official edit-page link. Publishing requires Share on LinkedIn with `w_member_social` and Sign In with LinkedIn using OpenID Connect with `openid` for the authenticated member URN.
 
-**Tech Stack:** Rust stable; Tokio async runtime; an MCP Rust SDK compatible with the chosen protocol; Reqwest with Rustls; Serde; OAuth 2.0 Authorization Code with PKCE if supported by LinkedIn for this client flow; OS keyring integration for tokens. Select maintained crate versions during implementation and pin them in `Cargo.toml`/`Cargo.lock`.
+**Tech Stack:** Rust stable, Tokio, an MCP Rust SDK compatible with the chosen protocol, Reqwest with Rustls, Serde, OAuth 2.0 Authorization Code with LinkedIn native PKCE, and the OS keyring. Select maintained crate versions during implementation and pin them in `Cargo.toml`/`Cargo.lock`.
 
 **Spec:** `docs/superpowers/specs/2026-11-25-linkedin-mcp-design.md`
 
@@ -14,6 +14,7 @@
 
 - Local MCP transport is stdio; initial platform is Linux.
 - Use only documented LinkedIn APIs, OAuth and permissions actually approved for the app.
+- Request only `openid` and `w_member_social`; `openid` supplies the authenticated member subject used to construct the person URN, and `w_member_social` permits the personal post.
 - No scraping, browser automation, UI injection, private endpoints, engagement automation, or bypass of rate limits.
 - Never publish without explicit confirmation tied to the exact content being sent.
 - Do not edit the LinkedIn profile via API or browser; only prepare suggested text and open the official edit page.
@@ -22,7 +23,7 @@
 
 ## Review Focus
 
-- Missing Share on LinkedIn product or `w_member_social`: publish tool reports setup/access unavailable and performs no network write.
+- A missing local scope blocks publication before any API request. LinkedIn permission rejections return an access-required result.
 - OAuth state mismatch, invalid callback, or denied consent: reject authentication and do not save credentials.
 - Confirmation does not match the exact post text: reject publication.
 - LinkedIn timeout after request transmission: report an unknown result and do not retry.
@@ -64,11 +65,11 @@
 
 **Interfaces:**
 - Produces: `OAuthClient::authorize_url()`, `OAuthClient::exchange_code(callback) -> Result<TokenSet, OAuthError>`, `TokenStore::load() -> Result<Option<TokenSet>, TokenStoreError>`, and `TokenStore::save(&TokenSet) -> Result<(), TokenStoreError>`.
-- Callback validation must bind to the pending authorization using a cryptographically random `state`; use PKCE if supported by LinkedIn's documented flow.
+- Callback validation must bind to the pending authorization using a cryptographically random `state`. LinkedIn Developer Support must enable native PKCE for the app.
 
 - [ ] Write tests for valid callback, mismatched state, denied consent, expired token handling, token redaction, and unavailable keyring behavior.
 - [ ] Run `cargo test --test oauth_flow --test token_store`; expect failures before implementation.
-- [ ] Implement OAuth configuration from environment variables without printing client secrets; validate redirect URL and scopes against the configured allowlist.
+- [ ] Implement OAuth configuration from environment variables without printing client secrets. Validate the redirect URL and require both `openid` and `w_member_social` in the allowlist for login.
 - [ ] Implement a loopback callback listener bound only to localhost and validate state before token exchange.
 - [ ] Implement OS keyring storage; on unavailable keyring, return an actionable error rather than silently writing plaintext.
 - [ ] Run `cargo test --test oauth_flow --test token_store`; expect all callback validation and storage behavior assertions to pass.
@@ -80,19 +81,21 @@
 - Create: `src/linkedin/client.rs`
 - Create: `src/linkedin/models.rs`
 - Modify: `src/linkedin/mod.rs`
+- Modify: `src/linkedin/oauth.rs`
+- Modify: `src/linkedin/token_store.rs`
 - Modify: `src/config.rs`
-- Test: `tests/linkedin_client.rs`
+- Update the README and design with both app products, native PKCE, and the consumer endpoints.
 
 **Interfaces:**
-- Produces: `LinkedInClient::connection_status() -> ConnectionStatus` and `LinkedInClient::create_text_post(text: &str) -> Result<PublishedPost, LinkedInApiError>`.
-- `PublishedPost` contains the returned post URN and optional URL; `ConnectionStatus` contains connected state and approved scopes, never token values.
+- Produces `LinkedInClient::connection_status() -> ConnectionStatus` and async `LinkedInClient::create_text_post(text: &str) -> Result<PublishedPost, LinkedInApiError>`.
+- `PublishedPost` contains the returned post URN and an optional URL. `ConnectionStatus` contains local connected state and approved scopes.
+- Resolve the authenticated member with `GET https://api.linkedin.com/v2/userinfo` using the OAuth bearer token. Consume only `sub` and construct `urn:li:person:{sub}` locally.
+- Publish exclusively through the [Share on LinkedIn consumer endpoint](https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/share-on-linkedin), `POST /v2/ugcPosts` on `https://api.linkedin.com`, with `X-Restli-Protocol-Version: 2.0.0`. Use the text-only `ShareContent` shape and explicit `PUBLIC` visibility. This endpoint uses the Share on LinkedIn product and `w_member_social`.
 
-- [ ] Add HTTP-mocked tests for missing credentials, missing `w_member_social`, successful 201 response, 401/403, rate limiting, malformed response, and timeout-after-send handling.
-- [ ] Run `cargo test --test linkedin_client`; expect tests to fail before the client exists.
-- [ ] Implement a Reqwest client that targets only the documented LinkedIn API host, attaches OAuth bearer token and required version/protocol headers, and uses timeouts.
-- [ ] Implement scope gating before any write; unsupported or unapproved access must return an access-required result without sending a POST.
-- [ ] Map API response headers and error bodies to safe typed results; redact bearer tokens and avoid retrying writes on timeout or ambiguous network failure.
-- [ ] Run `cargo test --test linkedin_client`; expect mocked API and no-write scope checks to pass.
+- [ ] Implement a Reqwest client with fixed HTTPS endpoints, bearer authentication, timeouts, and redirects and retries disabled.
+- [ ] Require both `openid` and `w_member_social` in the configured allowlist and stored grant before publishing. Credentials from the earlier share-only OAuth flow require reauthorization.
+- [ ] Map statuses and the `X-RestLi-Id` success header to safe typed results. Discard raw error bodies. Treat timeouts, ambiguous network failures, and unconfirmed responses as unknown publication outcomes.
+- [ ] Review the implementation statically per the Task 3 instruction. Record scope gating, 201 handling, 401/403, rate limiting, malformed responses, and ambiguous timeout paths in the Task 3 report.
 
 ### Task 4: Add profile drafting and status MCP tools
 
@@ -153,4 +156,4 @@
 - [ ] Run `cargo test`; expect all unit, integration, and protocol tests to pass.
 - [ ] Run `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`; fix formatting and lint findings.
 - [ ] Review docs and error paths for accidental token/content logging; add a regression assertion that captured logs do not contain the fixture token.
-- [ ] Document that actual publishing remains unavailable until the app has the official product and granted scope; describe a manual account-level smoke check the user can perform after configuring credentials.
+- [ ] Document the requirement for both app products and granted scopes. Describe a manual account-level smoke check the user can perform after configuring credentials.

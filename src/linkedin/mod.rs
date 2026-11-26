@@ -1,3 +1,5 @@
+pub mod client;
+pub mod models;
 pub mod oauth;
 pub mod token_store;
 
@@ -6,7 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::config::SHARE_SCOPE;
+use crate::config::{PUBLISH_SCOPES, SHARE_SCOPE};
 
 pub struct TokenSet {
     client_id: String,
@@ -24,7 +26,10 @@ impl TokenSet {
     }
 
     pub fn scopes(&self) -> &[&'static str] {
-        &[SHARE_SCOPE]
+        match self.record.grant {
+            ScopeGrant::ShareOnly => &[SHARE_SCOPE],
+            ScopeGrant::OpenIdAndShare => &PUBLISH_SCOPES,
+        }
     }
 }
 
@@ -44,6 +49,16 @@ impl fmt::Debug for TokenSet {
 struct TokenRecord {
     access_token: Zeroizing<String>,
     expires_at_unix: u64,
+    #[serde(default)]
+    grant: ScopeGrant,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+enum ScopeGrant {
+    // Older credential records omit the grant and could only request sharing.
+    #[default]
+    ShareOnly,
+    OpenIdAndShare,
 }
 
 fn valid_token(token: &str) -> bool {

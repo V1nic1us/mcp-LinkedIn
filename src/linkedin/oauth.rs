@@ -20,9 +20,9 @@ use tokio::{
 use url::{form_urlencoded, Host, Position, Url};
 use zeroize::Zeroizing;
 
-use crate::config::{parse_loopback_redirect, AppConfig, ConfigError, SHARE_SCOPE};
+use crate::config::{parse_loopback_redirect, AppConfig, ConfigError, PUBLISH_SCOPES};
 
-use super::{valid_token, TokenRecord, TokenSet};
+use super::{valid_token, ScopeGrant, TokenRecord, TokenSet};
 
 const AUTHORIZE_ENDPOINT: &str = "https://www.linkedin.com/oauth/native-pkce/authorization";
 const TOKEN_ENDPOINT: &str = "https://www.linkedin.com/oauth/v2/accessToken";
@@ -53,7 +53,7 @@ impl OAuthClient {
         )
         .map_err(OAuthError::Config)?;
         config.validate_scopes().map_err(OAuthError::Config)?;
-        if config.linkedin_allowed_scopes.is_empty() {
+        if !config.allows_publish_scopes() {
             return Err(OAuthError::MissingScope);
         }
 
@@ -102,7 +102,7 @@ impl OAuthClient {
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.client_id)
             .append_pair("redirect_uri", redirect_uri.as_str())
-            .append_pair("scope", SHARE_SCOPE)
+            .append_pair("scope", &requested_scopes())
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
@@ -177,11 +177,10 @@ impl OAuthClient {
             .checked_add(token.expires_in)
             .filter(|_| token.expires_in != 0)
             .ok_or(OAuthError::InvalidToken)?;
+        let scopes: Vec<_> = token.scope.split_ascii_whitespace().collect();
         if !valid_token(&token.access_token)
-            || token
-                .scope
-                .as_deref()
-                .is_some_and(|scope| scope != SHARE_SCOPE)
+            || scopes.len() != PUBLISH_SCOPES.len()
+            || !PUBLISH_SCOPES.iter().all(|scope| scopes.contains(scope))
         {
             return Err(OAuthError::InvalidToken);
         }
@@ -190,6 +189,7 @@ impl OAuthClient {
             record: TokenRecord {
                 access_token: token.access_token,
                 expires_at_unix,
+                grant: ScopeGrant::OpenIdAndShare,
             },
         })
     }
@@ -199,7 +199,13 @@ impl OAuthClient {
 struct TokenResponse {
     access_token: Zeroizing<String>,
     expires_in: u64,
-    scope: Option<String>,
+    // OAuth permits omission when the grant matches the requested scopes.
+    #[serde(default = "requested_scopes")]
+    scope: String,
+}
+
+fn requested_scopes() -> String {
+    PUBLISH_SCOPES.join(" ")
 }
 
 pub struct PendingAuthorization {
@@ -401,7 +407,7 @@ impl fmt::Display for OAuthError {
             Self::Config(error) => return fmt::Display::fmt(error, formatter),
             Self::MissingClientId => "set LINKEDIN_CLIENT_ID before starting LinkedIn OAuth",
             Self::MissingRedirect => "set LINKEDIN_REDIRECT_URI before starting LinkedIn OAuth",
-            Self::MissingScope => "set LINKEDIN_ALLOWED_SCOPES to w_member_social after enabling Share on LinkedIn",
+            Self::MissingScope => "set LINKEDIN_ALLOWED_SCOPES to 'openid w_member_social' after enabling Sign In with LinkedIn using OpenID Connect and Share on LinkedIn",
             Self::Randomness => "could not generate secure randomness for LinkedIn OAuth",
             Self::BindCallback => "could not bind the LinkedIn loopback callback; check that the configured loopback address is available",
             Self::ReadCallback => "could not accept the LinkedIn loopback callback",
@@ -410,7 +416,7 @@ impl fmt::Display for OAuthError {
             Self::InvalidCallback => "invalid LinkedIn OAuth callback",
             Self::StateMismatch => "LinkedIn OAuth callback did not match the pending authorization",
             Self::ConsentDenied => "LinkedIn consent was declined",
-            Self::AuthorizationRejected => "LinkedIn rejected authorization; check Share on LinkedIn and the redirect URI, and confirm that LinkedIn Developer Support enabled native PKCE OAuth for the app",
+            Self::AuthorizationRejected => "LinkedIn rejected authorization; check both LinkedIn products and the redirect URI, and confirm that LinkedIn Developer Support enabled native PKCE OAuth for the app",
             Self::InvalidClock => "the system clock is invalid; correct it before using LinkedIn OAuth",
             Self::Transport => "could not complete the HTTPS request to LinkedIn; check connectivity and start authorization again",
             Self::TokenRejected(status) => return write!(

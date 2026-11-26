@@ -7,6 +7,8 @@ use std::{
 use url::{Host, Url};
 
 pub(crate) const SHARE_SCOPE: &str = "w_member_social";
+pub(crate) const OPENID_SCOPE: &str = "openid";
+pub(crate) const PUBLISH_SCOPES: [&str; 2] = [OPENID_SCOPE, SHARE_SCOPE];
 
 pub struct AppConfig {
     pub linkedin_client_id: Option<String>,
@@ -39,11 +41,20 @@ impl AppConfig {
         if self
             .linkedin_allowed_scopes
             .iter()
-            .any(|scope| scope != SHARE_SCOPE)
+            .any(|scope| !PUBLISH_SCOPES.contains(&scope.as_str()))
         {
             return Err(ConfigError::UnsupportedScope);
         }
         Ok(())
+    }
+
+    pub(crate) fn allows_publish_scopes(&self) -> bool {
+        self.validate_scopes().is_ok()
+            && PUBLISH_SCOPES.iter().all(|scope| {
+                self.linkedin_allowed_scopes
+                    .iter()
+                    .any(|allowed| allowed.as_str() == *scope)
+            })
     }
 }
 
@@ -64,7 +75,7 @@ impl fmt::Display for ConfigError {
                 "LINKEDIN_REDIRECT_URI must be an HTTP URL on 127.0.0.1 or [::1] with a simple path and no port",
             ),
             Self::UnsupportedScope => formatter.write_str(
-                "LINKEDIN_ALLOWED_SCOPES supports only w_member_social (Share on LinkedIn)",
+                "LINKEDIN_ALLOWED_SCOPES supports only openid and w_member_social",
             ),
         }
     }

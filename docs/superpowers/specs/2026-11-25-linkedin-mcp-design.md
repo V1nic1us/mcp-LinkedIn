@@ -7,7 +7,7 @@ Criar um servidor MCP em Rust para permitir que agentes de IA compatíveis com M
 ## Objetivos
 
 - Integrar com clientes de agentes que aceitem MCP (incluindo Codex, Claude e outros compatíveis).
-- Usar OAuth 2.0 e apenas produtos, escopos e endpoints oficiais efetivamente habilitados para o app.
+- Usar OAuth 2.0 e apenas produtos, escopos e endpoints oficiais efetivamente habilitados para o app. Publicação pessoal requer `w_member_social`; obter o URN do autor requer `openid` via OpenID Connect.
 - Oferecer ferramentas para preparar um post, revisar o conteúdo e publicar somente após confirmação explícita do usuário.
 - Oferecer apoio à edição de perfil: gerar/revisar texto de campos com base em dados fornecidos pelo usuário e abrir a página oficial de edição; não editar o perfil via API ou navegador.
 - Manter tokens fora de logs e protegidos em armazenamento local apropriado.
@@ -21,7 +21,8 @@ Criar um servidor MCP em Rust para permitir que agentes de IA compatíveis com M
 
 ## Restrições e premissas
 
-- A publicação pessoal pode usar a API oficial de posts com OAuth e `w_member_social`, se o produto Share on LinkedIn estiver habilitado no app. O acesso e os termos atuais precisam ser confirmados antes de liberar a função.
+- A publicação pessoal usa o produto Share on LinkedIn (`w_member_social`) e o endpoint de consumo `POST https://api.linkedin.com/v2/ugcPosts` com `X-Restli-Protocol-Version: 2.0.0`. A requisição usa `ShareContent` com texto, categoria `NONE` e visibilidade explícita `PUBLIC`.
+- O app também precisa de Sign In with LinkedIn using OpenID Connect (`openid`). O cliente usa o token OAuth em `GET https://api.linkedin.com/v2/userinfo`, lê somente `sub` e forma localmente `urn:li:person:{sub}`. Os escopos solicitados são exatamente `openid` e `w_member_social`.
 - A documentação de People APIs menciona edição de perfil, mas não demonstra disponibilidade geral. O MVP não dependerá desse acesso.
 - Clientes diferentes podem suportar transportes MCP distintos. Compatibilidade significa suporte ao transporte configurado pelo usuário; não será possível garantir integração universal com apps sem suporte MCP.
 - Falhas da API, revogação de consentimento e limites de taxa devem ser retornados claramente, sem tentativas de contornar bloqueios.
@@ -36,16 +37,16 @@ O MVP usa stdio, com separação interna entre protocolo MCP e integração Link
 
 ## Experiência e capacidades propostas
 
-- `prepare_post`: recebe texto (e, numa primeira versão, opcionalmente URL), valida limites e devolve uma prévia; não publica.
+- `prepare_post`: recebe texto, valida limites e devolve uma prévia local.
 - `publish_post`: recebe o texto exato e uma confirmação explícita no mesmo pedido, envia uma publicação textual via API oficial e devolve o identificador/link quando disponível. Sem confirmação, recusa a ação.
 - `draft_profile_update`: recebe o campo e o texto atual/proposto fornecido pelo usuário, sugere uma versão editada e devolve um link para a página de edição do LinkedIn. Não lê ou altera a conta.
-- `linkedin_connection_status`: informa se OAuth está configurado e quais permissões foram concedidas, sem expor tokens.
+- `linkedin_connection_status`: informa a partir do cofre local se há uma credencial válida para os dois escopos permitidos e lista os escopos concedidos. O resultado contém apenas o estado da conexão e os escopos.
 
 A publicação com mídia, leitura do perfil e publicação em páginas de organizações ficam para depois do MVP e exigem análise de escopos, aprovação e requisitos próprios.
 
 ## Segurança e privacidade
 
-- OAuth 2.0 com fluxo adequado a aplicativo instalado, callback local com validação de `state` e proteção contra CSRF.
+- OAuth 2.0 com PKCE nativo habilitado pelo suporte do LinkedIn e callback local com validação de `state` para proteção contra CSRF.
 - Armazenar tokens no cofre do sistema operacional quando disponível; oferecer alternativa explícita e segura quando não houver cofre.
 - Nunca registrar tokens, códigos OAuth ou conteúdo privado por padrão.
 - Validar que o autor é o membro autenticado; não aceitar URNs arbitrárias do agente para publicar como outra pessoa.
@@ -55,7 +56,7 @@ A publicação com mídia, leitura do perfil e publicação em páginas de organ
 ## Decisões para o implementador
 
 - Escolher crates Rust mantidos para MCP, OAuth, HTTP e armazenamento seguro após verificar compatibilidade e licença.
-- Definir a versão suportada do protocolo/API do LinkedIn e uma estratégia de atualização.
+- Acompanhar mudanças no endpoint Share on LinkedIn e no protocolo Rest.li.
 - Determinar como iniciar o callback OAuth de forma consistente nos sistemas operacionais suportados.
 - Propor instalação e configuração documentadas para os clientes MCP inicialmente selecionados.
 
@@ -64,15 +65,15 @@ A publicação com mídia, leitura do perfil e publicação em páginas de organ
 Não há questões que impeçam o plano. Decisões assumidas para o primeiro marco:
 
 - Priorizar Linux, conforme o ambiente atual, e documentar configuração para Codex, Claude e outros clientes que aceitem MCP por stdio; suporte depende do transporte MCP que cada cliente oferece.
-- Verificar o produto Share on LinkedIn e `w_member_social` no início. Se não estiverem habilitados, deixar a publicação bloqueada e incluir a solicitação/validação de acesso como pré-requisito, sem usar automação de interface.
+- Exigir os dois produtos e escopos para publicar. Credenciais locais do fluxo anterior conservam apenas `w_member_social` e precisam de nova autorização.
 - A confirmação será uma etapa explícita ligada ao texto exato publicado.
-- Começar com posts de texto e links; mídia fica para etapa futura.
+- Começar com posts públicos de texto. Anexos ficam para uma etapa futura.
 
 ## Fontes consultadas
 
 - [LinkedIn User Agreement](https://www.linkedin.com/legal/user-agreement)
 - [Prohibited software and extensions](https://www.linkedin.com/help/linkedin/answer/a1341387/prohibited-software-and-extensions)
 - [Getting Access to LinkedIn APIs](https://learn.microsoft.com/en-us/linkedin/shared/authentication/getting-access)
-- [Share on LinkedIn](https://learn.microsoft.com/linkedin/consumer/integrations/self-serve/share-on-linkedin)
-- [Posts API](https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api)
+- [Share on LinkedIn](https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/share-on-linkedin)
 - [People APIs](https://learn.microsoft.com/en-us/linkedin/shared/integrations/people/overview)
+- [Sign In with LinkedIn using OpenID Connect](https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/sign-in-with-linkedin-v2)

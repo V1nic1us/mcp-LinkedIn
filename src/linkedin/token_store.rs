@@ -1,7 +1,8 @@
-use std::{error::Error, fmt};
-
-#[cfg(target_os = "linux")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    error::Error,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(target_os = "linux")]
 use zeroize::Zeroizing;
@@ -113,8 +114,7 @@ impl TokenStore {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn is_expired(expires_at_unix: u64) -> Result<bool, TokenStoreError> {
+pub(super) fn is_expired(expires_at_unix: u64) -> Result<bool, TokenStoreError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| TokenStoreError::InvalidClock)?;
