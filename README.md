@@ -67,9 +67,12 @@ credential.
 Run `./target/release/linkedin-mcp auth logout` with the same
 `LINKEDIN_CLIENT_ID` and `XDG_RUNTIME_DIR` to delete the local credential and
 prevent pending logins for that app from saving a credential. The runtime
-directory holds a checksummed per-app logout state record. Credentials stay in the keyring.
-A prior coordination file from an older release is left untouched. It contains
-only logout timestamps and is ignored by this version.
+directory holds a checksummed per-app logout record. Logout also sets the legacy
+coordination file to one byte. This file contains no credentials. Its length is
+a compatibility fence that makes older CLIs using that file reject a token save,
+even if consent was already underway. Use the current CLI for subsequent logins.
+If logout is interrupted, run it again with the current CLI to finish deletion.
+
 To revoke the app's LinkedIn access, open **Settings & Privacy → Data privacy →
 Permitted Services** in LinkedIn and remove the app. [LinkedIn disconnect steps](https://www.linkedin.com/help/linkedin/answer/a521848/)
 

@@ -29,9 +29,12 @@ pub(super) fn monotonic_now() -> i128 {
     i128::from(now.tv_sec) * 1_000_000_000 + i128::from(now.tv_nsec)
 }
 
-/// Coordinates CLI credential changes across processes using one versioned
-/// state record. The file stays unlocked during browser consent.
-pub(super) struct AuthSession(File);
+/// The state file stays unlocked during browser consent.
+pub(super) struct AuthSession {
+    state: File,
+    dir: File,
+    legacy_name: String,
+}
 
 impl AuthSession {
     pub(super) fn open(config: &AppConfig) -> Result<Self, &'static str> {
@@ -57,30 +60,12 @@ impl AuthSession {
         }
 
         let app = URL_SAFE_NO_PAD.encode(digest(&SHA256, client_id.as_bytes()).as_ref());
-        let file_name = format!("linkedin-mcp-auth-v2-{app}");
-        let file = fs::openat(
-            &dir,
-            file_name.as_str(),
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(|_| RUNTIME_ERROR)?;
-        Ok(Self(file.into()))
-    }
-
-    fn lock(self) -> Result<(File, u64), &'static str> {
-        let file = self.0;
-        fs::flock(&file, FlockOperation::LockExclusive).map_err(|_| RUNTIME_ERROR)?;
-        let info = fs::fstat(&file).map_err(|_| RUNTIME_ERROR)?;
-        if FileType::from_raw_mode(info.st_mode) != FileType::RegularFile
-            || info.st_uid != geteuid().as_raw()
-            || info.st_mode & 0o077 != 0
-            || info.st_nlink != 1
-        {
-            return Err(RUNTIME_ERROR);
-        }
-        let len = u64::try_from(info.st_size).map_err(|_| RUNTIME_ERROR)?;
-        Ok((file, len))
+        let dir = File::from(dir);
+        Ok(Self {
+            state: open_file(&dir, &format!("linkedin-mcp-auth-v2-{app}"))?,
+            dir,
+            legacy_name: format!("linkedin-mcp-auth-{app}"),
+        })
     }
 
     pub(super) fn save(
@@ -89,8 +74,8 @@ impl AuthSession {
         tokens: &TokenSet,
         started_at: i128,
     ) -> Result<(), Box<dyn Error>> {
-        let (file, len) = self.lock()?;
-        let state = read_state(&file, len)?;
+        let len = lock(&self.state)?;
+        let state = read_state(&self.state, len)?;
         match state {
             Some(StateRecord {
                 status: PENDING, ..
@@ -106,20 +91,28 @@ impl AuthSession {
     }
 
     pub(super) fn logout(self, store: &TokenStore) -> Result<(), Box<dyn Error>> {
-        let (file, _) = self.lock()?;
-        // Persist the blocking state before any keyring deletion.
+        // All two-file operations lock v2 first, then legacy, through completion.
+        lock(&self.state)?;
+        let legacy = open_file(&self.dir, &self.legacy_name)?;
+        lock(&legacy)?;
         write_state(
-            &file,
+            &self.state,
             StateRecord {
                 status: PENDING,
                 timestamp: monotonic_now(),
             },
         )?;
+        // Change the length in place so even a login holding an older open
+        // descriptor sees the fence. Both legacy formats reject one byte.
+        legacy.set_len(1).map_err(|_| RUNTIME_ERROR)?;
+        legacy.sync_all().map_err(|_| RUNTIME_ERROR)?;
+        // Either name may have been created by this logout.
+        self.dir.sync_all().map_err(|_| RUNTIME_ERROR)?;
         store.delete()?;
 
         // Successful completion permits new logins and invalidates older ones.
         write_state(
-            &file,
+            &self.state,
             StateRecord {
                 status: COMPLETED,
                 timestamp: monotonic_now(),
@@ -127,6 +120,30 @@ impl AuthSession {
         )?;
         Ok(())
     }
+}
+
+fn open_file(dir: &File, name: &str) -> Result<File, &'static str> {
+    let file = fs::openat(
+        dir,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|_| RUNTIME_ERROR)?;
+    Ok(file.into())
+}
+
+fn lock(file: &File) -> Result<u64, &'static str> {
+    fs::flock(file, FlockOperation::LockExclusive).map_err(|_| RUNTIME_ERROR)?;
+    let info = fs::fstat(file).map_err(|_| RUNTIME_ERROR)?;
+    if FileType::from_raw_mode(info.st_mode) != FileType::RegularFile
+        || info.st_uid != geteuid().as_raw()
+        || info.st_mode & 0o077 != 0
+        || info.st_nlink != 1
+    {
+        return Err(RUNTIME_ERROR);
+    }
+    u64::try_from(info.st_size).map_err(|_| RUNTIME_ERROR)
 }
 
 #[derive(Clone, Copy)]
