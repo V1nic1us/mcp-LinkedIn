@@ -57,7 +57,7 @@ impl AuthSession {
         }
 
         let app = URL_SAFE_NO_PAD.encode(digest(&SHA256, client_id.as_bytes()).as_ref());
-        let file_name = format!("linkedin-mcp-auth-{app}");
+        let file_name = format!("linkedin-mcp-auth-v2-{app}");
         let file = fs::openat(
             &dir,
             file_name.as_str(),
