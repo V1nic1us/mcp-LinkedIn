@@ -14,8 +14,14 @@ use rustix::{
 
 const RUNTIME_ERROR: &str =
     "could not use the auth coordination file; check the private XDG_RUNTIME_DIR for this Linux user";
-const TIMESTAMP_BYTES: u64 = size_of::<i128>() as u64;
+const STATE_BYTES: u64 = 32;
+const STATE_MAGIC: &[u8; 4] = b"LIAS";
+const STATE_VERSION: u8 = 1;
+const COMPLETED: u8 = 0;
+const PENDING: u8 = 1;
 const CANCELLED: &str = "local logout cancelled this LinkedIn login; start authorization again";
+const LOGOUT_PENDING: &str =
+    "a previous LinkedIn logout was interrupted; run auth logout again to complete it";
 
 /// Linux's monotonic clock has the same origin in both CLI processes.
 pub(super) fn monotonic_now() -> i128 {
@@ -23,8 +29,8 @@ pub(super) fn monotonic_now() -> i128 {
     i128::from(now.tv_sec) * 1_000_000_000 + i128::from(now.tv_nsec)
 }
 
-/// Coordinates CLI credential changes across processes using a file that holds
-/// only logout timestamps. The file stays unlocked during browser consent.
+/// Coordinates CLI credential changes across processes using one versioned
+/// state record. The file stays unlocked during browser consent.
 pub(super) struct AuthSession(File);
 
 impl AuthSession {
@@ -84,37 +90,95 @@ impl AuthSession {
         started_at: i128,
     ) -> Result<(), Box<dyn Error>> {
         let (file, len) = self.lock()?;
-        if len % TIMESTAMP_BYTES != 0 {
-            return Err(RUNTIME_ERROR.into());
-        }
-        if len != 0 {
-            let mut timestamp = [0; size_of::<i128>()];
-            file.read_exact_at(&mut timestamp, len - TIMESTAMP_BYTES)
-                .map_err(|_| RUNTIME_ERROR)?;
-            if started_at <= i128::from_le_bytes(timestamp) {
-                return Err(CANCELLED.into());
-            }
+        let state = read_state(&file, len)?;
+        match state {
+            Some(StateRecord {
+                status: PENDING, ..
+            }) => return Err(LOGOUT_PENDING.into()),
+            Some(StateRecord {
+                status: COMPLETED,
+                timestamp,
+            }) if started_at <= timestamp => return Err(CANCELLED.into()),
+            Some(_) | None => {}
         }
         store.save(tokens)?;
         Ok(())
     }
 
     pub(super) fn logout(self, store: &TokenStore) -> Result<(), Box<dyn Error>> {
-        let (file, len) = self.lock()?;
-        // Replace any partial tail without overwriting a complete marker.
-        let offset = len - len % TIMESTAMP_BYTES;
-        // Invalidate existing attempts even if the process exits during deletion.
-        record_logout_time(&file, offset)?;
+        let (file, _) = self.lock()?;
+        // Persist the blocking state before any keyring deletion.
+        write_state(
+            &file,
+            StateRecord {
+                status: PENDING,
+                timestamp: monotonic_now(),
+            },
+        )?;
         store.delete()?;
 
-        // Also invalidate attempts that started while deletion held the lock.
-        record_logout_time(&file, offset + TIMESTAMP_BYTES)?;
+        // Successful completion permits new logins and invalidates older ones.
+        write_state(
+            &file,
+            StateRecord {
+                status: COMPLETED,
+                timestamp: monotonic_now(),
+            },
+        )?;
         Ok(())
     }
 }
 
-fn record_logout_time(file: &File, offset: u64) -> Result<(), &'static str> {
-    file.write_all_at(&monotonic_now().to_le_bytes(), offset)
+#[derive(Clone, Copy)]
+struct StateRecord {
+    status: u8,
+    timestamp: i128,
+}
+
+fn encode_state(state: StateRecord) -> [u8; STATE_BYTES as usize] {
+    let mut bytes = [0; STATE_BYTES as usize];
+    bytes[..4].copy_from_slice(STATE_MAGIC);
+    bytes[4] = STATE_VERSION;
+    bytes[5] = state.status;
+    bytes[8..24].copy_from_slice(&state.timestamp.to_le_bytes());
+    let checksum = digest(&SHA256, &bytes[..24]);
+    bytes[24..].copy_from_slice(&checksum.as_ref()[..8]);
+    bytes
+}
+
+fn decode_state(bytes: &[u8; STATE_BYTES as usize]) -> Result<StateRecord, &'static str> {
+    let checksum = digest(&SHA256, &bytes[..24]);
+    if &bytes[..4] != STATE_MAGIC
+        || bytes[4] != STATE_VERSION
+        || !matches!(bytes[5], COMPLETED | PENDING)
+        || bytes[6..8] != [0; 2]
+        || bytes[24..] != checksum.as_ref()[..8]
+    {
+        return Err(RUNTIME_ERROR);
+    }
+    let timestamp = i128::from_le_bytes(bytes[8..24].try_into().map_err(|_| RUNTIME_ERROR)?);
+    Ok(StateRecord {
+        status: bytes[5],
+        timestamp,
+    })
+}
+
+fn read_state(file: &File, len: u64) -> Result<Option<StateRecord>, &'static str> {
+    if len == 0 {
+        return Ok(None);
+    }
+    if len != STATE_BYTES {
+        return Err(RUNTIME_ERROR);
+    }
+    let mut bytes = [0; STATE_BYTES as usize];
+    file.read_exact_at(&mut bytes, 0)
         .map_err(|_| RUNTIME_ERROR)?;
+    decode_state(&bytes).map(Some)
+}
+
+fn write_state(file: &File, state: StateRecord) -> Result<(), &'static str> {
+    file.write_all_at(&encode_state(state), 0)
+        .map_err(|_| RUNTIME_ERROR)?;
+    file.set_len(STATE_BYTES).map_err(|_| RUNTIME_ERROR)?;
     file.sync_all().map_err(|_| RUNTIME_ERROR)
 }
