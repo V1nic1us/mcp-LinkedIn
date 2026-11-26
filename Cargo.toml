@@ -1,0 +1,11 @@
+[package]
+name = "linkedin-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+
+[dependencies]
+async-trait = "0.1"
+rust-mcp-sdk = { version = "=1.1.0", default-features = false, features = ["server", "stdio"] }
+tokio = { version = "1", features = ["macros", "rt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
