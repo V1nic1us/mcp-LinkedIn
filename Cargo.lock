@@ -883,6 +883,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rust-mcp-sdk",
+ "rustix",
  "serde",
  "serde_json",
  "subtle",

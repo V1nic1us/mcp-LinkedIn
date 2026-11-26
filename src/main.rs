@@ -1,18 +1,16 @@
+#[cfg(target_os = "linux")]
+mod auth_session;
 mod stdio;
 
-use std::{
-    env,
-    error::Error,
-    io,
-    process::{ExitCode, Stdio},
-    sync::Arc,
-};
+use std::{env, error::Error, io, process::ExitCode, sync::Arc};
+
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 
 use async_trait::async_trait;
-use linkedin_mcp::{
-    config::AppConfig,
-    linkedin::{oauth::OAuthClient, token_store::TokenStore},
-};
+use linkedin_mcp::config::AppConfig;
+#[cfg(target_os = "linux")]
+use linkedin_mcp::linkedin::{oauth::OAuthClient, token_store::TokenStore};
 use rust_mcp_sdk::{
     mcp_server::{server_runtime, McpServerOptions, ServerHandler},
     schema::{
@@ -67,8 +65,14 @@ async fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
     let result = match args.as_slice() {
         [] => run_server().await,
+        #[cfg(target_os = "linux")]
         [auth, command] if auth == "auth" && command == "login" => login().await,
+        #[cfg(target_os = "linux")]
         [auth, command] if auth == "auth" && command == "logout" => logout(),
+        #[cfg(not(target_os = "linux"))]
+        [auth, command] if auth == "auth" && (command == "login" || command == "logout") => {
+            Err(linkedin_mcp::linkedin::token_store::TokenStoreError::Unavailable.into())
+        }
         _ => Err("usage: linkedin-mcp [auth login|auth logout]".into()),
     };
     match result {
@@ -97,10 +101,13 @@ async fn run_server() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn login() -> Result<(), Box<dyn Error>> {
+    let started_at = auth_session::monotonic_now();
     let config = AppConfig::from_env()?;
     let oauth = OAuthClient::new(&config)?;
     let store = TokenStore::new(&config)?;
+    let session = auth_session::AuthSession::open(&config)?;
     // Check keyring access before opening the browser.
     drop(store.load()?);
     let pending = oauth.authorize_url().await?;
@@ -130,14 +137,16 @@ async fn login() -> Result<(), Box<dyn Error>> {
         }
     };
     let tokens = oauth.exchange_code(callback).await?;
-    store.save(&tokens)?;
+    session.save(&store, &tokens, started_at)?;
     eprintln!("linkedin-mcp: LinkedIn credential saved in the OS keyring");
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn logout() -> Result<(), Box<dyn Error>> {
     let config = AppConfig::from_env()?;
-    TokenStore::new(&config)?.delete()?;
+    let store = TokenStore::new(&config)?;
+    auth_session::AuthSession::open(&config)?.logout(&store)?;
     eprintln!("linkedin-mcp: local LinkedIn credential cleared");
     Ok(())
 }

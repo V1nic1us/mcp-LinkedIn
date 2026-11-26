@@ -24,7 +24,7 @@ the input stream. Stdout carries MCP messages and stderr carries diagnostics.
 | Variable | Value |
 | --- | --- |
 | `LINKEDIN_CLIENT_ID` | LinkedIn application client ID. |
-| `LINKEDIN_REDIRECT_URI` | Exact OAuth callback URI for the LinkedIn app, using `http://127.0.0.1` or `http://[::1]` with an explicit port above 1023 and a simple path. |
+| `LINKEDIN_REDIRECT_URI` | OAuth callback template with a literal loopback IP and a simple path, for example `http://127.0.0.1/callback` or `http://[::1]/callback`. Omit the port. |
 | `LINKEDIN_ALLOWED_SCOPES` | Space-separated scope allowlist. Set to `w_member_social` for login. This is the only supported scope. |
 | `LINKEDIN_API_VERSION` | LinkedIn API version to use when API calls are added. |
 
@@ -39,31 +39,35 @@ startup error that names the variable.
    `w_member_social`. [Share on LinkedIn setup](https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/share-on-linkedin)
 2. Ask LinkedIn Developer Support or your LinkedIn contact to enable **native
    PKCE OAuth** for the app. Wait for confirmation before attempting consent.
-   In the app's **Auth** settings, copy its client ID and register the loopback
-   callback URI, for example `http://127.0.0.1:8765/callback`. Use the same
-   scheme, IP, port, and path in your environment. Supply the public client ID
-   only. The app generates its own per-attempt PKCE verifier. [LinkedIn native OAuth setup](https://learn.microsoft.com/en-us/linkedin/shared/authentication/authorization-code-flow-native)
-3. From your Linux desktop session, make sure `xdg-open` and an unlocked
-   Secret Service keyring are available. Run the commands below, then review
-   and approve the requested permission in your default browser.
+   Copy the public client ID from the app's **Auth** settings. Confirm with
+   LinkedIn how to register the callback's loopback IP and path for native
+   PKCE if your app requires redirect registration. Use the same IP and path
+   in your environment. The app adds an OS-assigned ephemeral port to the URI
+   for each consent attempt and generates its own PKCE verifier. [LinkedIn native OAuth setup](https://learn.microsoft.com/en-us/linkedin/shared/authentication/authorization-code-flow-native)
+3. From your Linux desktop session, make sure `xdg-open`, an unlocked
+   Secret Service keyring, and your private `XDG_RUNTIME_DIR` are available.
+   Run the commands below, then review and approve the requested permission
+   in your default browser.
 
 ```sh
 export LINKEDIN_CLIENT_ID=your_app_client_id
-export LINKEDIN_REDIRECT_URI=http://127.0.0.1:8765/callback
+export LINKEDIN_REDIRECT_URI=http://127.0.0.1/callback
 export LINKEDIN_ALLOWED_SCOPES=w_member_social
 ./target/release/linkedin-mcp auth login
 ```
 
 The callback listener opens on the configured loopback address for up to five
-minutes. The terminal reports success once the token is saved in the OS
-keyring. An unavailable keyring produces an error. Run `auth login` again to
-renew an expired credential.
+minutes. The token exchange must finish within that window. The terminal
+reports success once the token is saved in the OS keyring. An unavailable
+keyring produces an error. Run `auth login` again to renew an expired
+credential.
 
 ## Disconnect LinkedIn
 
 Run `./target/release/linkedin-mcp auth logout` with the same
-`LINKEDIN_CLIENT_ID` to delete the local credential. You can also remove the
-`linkedin-mcp` entry for that client ID in your desktop keyring manager.
+`LINKEDIN_CLIENT_ID` and `XDG_RUNTIME_DIR` to delete the local credential and
+prevent pending logins for that app from saving a credential. The runtime
+directory holds per-app logout timestamps. Credentials stay in the keyring.
 To revoke the app's LinkedIn access, open **Settings & Privacy → Data privacy →
 Permitted Services** in LinkedIn and remove the app. [LinkedIn disconnect steps](https://www.linkedin.com/help/linkedin/answer/a521848/)
 

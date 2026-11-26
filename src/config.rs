@@ -61,7 +61,7 @@ impl fmt::Display for ConfigError {
             Self::Empty { variable } => write!(formatter, "{variable} is set but empty"),
             Self::NonUnicode { variable } => write!(formatter, "{variable} must be valid UTF-8"),
             Self::InvalidRedirect => formatter.write_str(
-                "LINKEDIN_REDIRECT_URI must be an HTTP URL on 127.0.0.1 or [::1] with an explicit port above 1023 and a simple path",
+                "LINKEDIN_REDIRECT_URI must be an HTTP URL on 127.0.0.1 or [::1] with a simple path and no port",
             ),
             Self::UnsupportedScope => formatter.write_str(
                 "LINKEDIN_ALLOWED_SCOPES supports only w_member_social (Share on LinkedIn)",
@@ -92,7 +92,7 @@ pub(crate) fn parse_loopback_redirect(value: &str) -> Result<Url, ConfigError> {
     // spellings, dot segments, whitespace and a missing trailing slash.
     if url.scheme() != "http"
         || !loopback
-        || !url.port().is_some_and(|port| port > 1023)
+        || url.port().is_some()
         || url.as_str() != value
         || !url.username().is_empty()
         || url.password().is_some()

@@ -15,7 +15,7 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    time::{timeout, timeout_at, Instant},
+    time::{sleep_until, timeout, timeout_at, Instant},
 };
 use url::{form_urlencoded, Host, Position, Url};
 use zeroize::Zeroizing;
@@ -81,13 +81,17 @@ impl OAuthClient {
             Some(Host::Ipv6(ip)) => IpAddr::V6(ip),
             _ => return Err(OAuthError::Config(ConfigError::InvalidRedirect)),
         };
-        let port = self
-            .redirect_uri
-            .port()
-            .ok_or(OAuthError::Config(ConfigError::InvalidRedirect))?;
-        let listener = TcpListener::bind(SocketAddr::new(ip, port))
+        let listener = TcpListener::bind(SocketAddr::new(ip, 0))
             .await
             .map_err(|_| OAuthError::BindCallback)?;
+        let port = listener
+            .local_addr()
+            .map_err(|_| OAuthError::BindCallback)?
+            .port();
+        let mut redirect_uri = self.redirect_uri.clone();
+        redirect_uri
+            .set_port(Some(port))
+            .map_err(|_| OAuthError::Config(ConfigError::InvalidRedirect))?;
 
         let state = random_url_safe()?;
         let verifier = random_url_safe()?;
@@ -97,7 +101,7 @@ impl OAuthClient {
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.client_id)
-            .append_pair("redirect_uri", self.redirect_uri.as_str())
+            .append_pair("redirect_uri", redirect_uri.as_str())
             .append_pair("scope", SHARE_SCOPE)
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
@@ -107,7 +111,7 @@ impl OAuthClient {
             listener,
             url,
             client_id: self.client_id.clone(),
-            redirect_uri: self.redirect_uri.clone(),
+            redirect_uri,
             state,
             verifier,
             deadline: Instant::now() + CONSENT_TIMEOUT,
@@ -115,28 +119,47 @@ impl OAuthClient {
     }
 
     pub async fn exchange_code(&self, callback: LoopbackCallback) -> Result<TokenSet, OAuthError> {
-        if callback.redirect_uri != self.redirect_uri || callback.client_id != self.client_id {
+        let mut redirect_template = callback.redirect_uri.clone();
+        redirect_template
+            .set_port(None)
+            .map_err(|_| OAuthError::InvalidCallback)?;
+        if redirect_template != self.redirect_uri || callback.client_id != self.client_id {
             return Err(OAuthError::InvalidCallback);
         }
 
+        let deadline = callback.deadline;
+        if Instant::now() >= deadline {
+            return Err(OAuthError::ExchangeExpired);
+        }
+        let result = tokio::select! {
+            biased;
+            () = sleep_until(deadline) => return Err(OAuthError::ExchangeExpired),
+            result = self.request_token(callback) => result,
+        };
+        // Bounded JSON parsing runs synchronously and cannot be preempted.
+        if Instant::now() >= deadline {
+            return Err(OAuthError::ExchangeExpired);
+        }
+        result
+    }
+
+    async fn request_token(&self, callback: LoopbackCallback) -> Result<TokenSet, OAuthError> {
         // Start the local lifetime before the request, so latency cannot extend it.
         let requested_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| OAuthError::InvalidClock)?
             .as_secs();
-        let mut response = self
-            .http
-            .post(TOKEN_ENDPOINT)
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("code", callback.code.as_str()),
-                ("redirect_uri", self.redirect_uri.as_str()),
-                ("client_id", self.client_id.as_str()),
-                ("code_verifier", callback.verifier.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|_| OAuthError::Transport)?;
+        let request = self.http.post(TOKEN_ENDPOINT).form(&[
+            ("grant_type", "authorization_code"),
+            ("code", callback.code.as_str()),
+            ("redirect_uri", callback.redirect_uri.as_str()),
+            ("client_id", self.client_id.as_str()),
+            ("code_verifier", callback.verifier.as_str()),
+        ]);
+        if Instant::now() >= callback.deadline {
+            return Err(OAuthError::ExchangeExpired);
+        }
+        let mut response = request.send().await.map_err(|_| OAuthError::Transport)?;
         if !response.status().is_success() {
             return Err(OAuthError::TokenRejected(response.status().as_u16()));
         }
@@ -204,6 +227,7 @@ impl PendingAuthorization {
             client_id: self.client_id,
             redirect_uri: self.redirect_uri,
             verifier: self.verifier,
+            deadline: self.deadline,
         })
     }
 
@@ -339,6 +363,7 @@ pub struct LoopbackCallback {
     client_id: String,
     redirect_uri: Url,
     verifier: Zeroizing<String>,
+    deadline: Instant,
 }
 
 fn random_url_safe() -> Result<Zeroizing<String>, OAuthError> {
@@ -359,6 +384,7 @@ pub enum OAuthError {
     BindCallback,
     ReadCallback,
     CallbackTimeout,
+    ExchangeExpired,
     InvalidCallback,
     StateMismatch,
     ConsentDenied,
@@ -377,9 +403,10 @@ impl fmt::Display for OAuthError {
             Self::MissingRedirect => "set LINKEDIN_REDIRECT_URI before starting LinkedIn OAuth",
             Self::MissingScope => "set LINKEDIN_ALLOWED_SCOPES to w_member_social after enabling Share on LinkedIn",
             Self::Randomness => "could not generate secure randomness for LinkedIn OAuth",
-            Self::BindCallback => "could not bind the LinkedIn loopback callback; check the configured address and whether the port is in use",
+            Self::BindCallback => "could not bind the LinkedIn loopback callback; check that the configured loopback address is available",
             Self::ReadCallback => "could not accept the LinkedIn loopback callback",
-            Self::CallbackTimeout => "no valid LinkedIn callback arrived; check the browser and registered redirect URI, and confirm that LinkedIn Developer Support enabled native PKCE OAuth for the app",
+            Self::CallbackTimeout => "no valid LinkedIn callback arrived; check the browser and loopback callback settings, and confirm that LinkedIn Developer Support enabled native PKCE OAuth for the app",
+            Self::ExchangeExpired => "the LinkedIn authorization window expired; start authorization again",
             Self::InvalidCallback => "invalid LinkedIn OAuth callback",
             Self::StateMismatch => "LinkedIn OAuth callback did not match the pending authorization",
             Self::ConsentDenied => "LinkedIn consent was declined",
