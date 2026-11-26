@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use reqwest::{
     header::{CONTENT_TYPE, RETRY_AFTER},
@@ -8,7 +12,11 @@ use serde::Deserialize;
 use serde_json::json;
 use zeroize::Zeroizing;
 
+#[cfg(target_os = "linux")]
+use crate::auth_session::AuthSession;
 use crate::config::{AppConfig, PUBLISH_SCOPES};
+use ring::digest::{digest, SHA256};
+use subtle::ConstantTimeEq;
 
 use super::{
     models::{ConnectionStatus, LinkedInApiError, PublishedPost},
@@ -20,11 +28,14 @@ const USERINFO_ENDPOINT: &str = "https://api.linkedin.com/v2/userinfo";
 const UGC_POSTS_ENDPOINT: &str = "https://api.linkedin.com/v2/ugcPosts";
 const MAX_USERINFO_BYTES: usize = 16 * 1024;
 const MAX_POST_LENGTH: usize = 3000;
+static CONSUMED_CONFIRMATIONS: Mutex<BTreeSet<(String, [u8; 32])>> = Mutex::new(BTreeSet::new());
 
 pub struct LinkedInClient {
     http: reqwest::Client,
     store: Option<Arc<TokenStore>>,
     allows_publish_scopes: bool,
+    #[cfg(target_os = "linux")]
+    session: Option<Arc<AuthSession>>,
 }
 
 impl LinkedInClient {
@@ -35,6 +46,14 @@ impl LinkedInClient {
             .filter(|id| !id.trim().is_empty())
             .map(|_| TokenStore::new(config).map(Arc::new))
             .transpose()?;
+        #[cfg(target_os = "linux")]
+        let session = if store.is_some() {
+            Some(Arc::new(
+                AuthSession::open(config).map_err(LinkedInApiError::Coordination)?,
+            ))
+        } else {
+            None
+        };
         let http = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
@@ -51,30 +70,47 @@ impl LinkedInClient {
             http,
             store,
             allows_publish_scopes: config.allows_publish_scopes(),
+            #[cfg(target_os = "linux")]
+            session,
         })
     }
 
     /// Read local credential state from the keyring without contacting LinkedIn.
     pub fn connection_status(&self) -> ConnectionStatus {
-        let tokens = self
-            .store
-            .as_ref()
-            .and_then(|store| store.load().ok().flatten());
-        let approved_scopes = tokens.map_or_else(Vec::new, |tokens| tokens.scopes().to_vec());
-        ConnectionStatus {
-            connected: self.allows_publish_scopes
-                && PUBLISH_SCOPES
-                    .iter()
-                    .all(|scope| approved_scopes.contains(scope)),
-            approved_scopes,
-        }
+        connection_status(self.store.as_deref(), self.allows_publish_scopes)
+    }
+
+    pub(crate) fn local_connection_status(config: &AppConfig) -> ConnectionStatus {
+        let store = TokenStore::new(config).ok();
+        connection_status(store.as_ref(), config.allows_publish_scopes())
     }
 
     /// Publish the exact text after the caller has obtained explicit confirmation.
+    /// Each text digest can be used once per app in this process.
     pub async fn create_text_post(&self, text: &str) -> Result<PublishedPost, LinkedInApiError> {
         if !self.allows_publish_scopes {
             return Err(LinkedInApiError::AccessRequired);
         }
+        validate_text(text)?;
+        #[cfg(target_os = "linux")]
+        let session = self
+            .session
+            .clone()
+            .ok_or(LinkedInApiError::AccessRequired)?;
+        #[cfg(target_os = "linux")]
+        let _lease = loop {
+            let session = session.clone();
+            let lease = tokio::task::spawn_blocking(move || session.try_acquire_publish_lease())
+                .await
+                .map_err(|_| {
+                    LinkedInApiError::Coordination("could not acquire LinkedIn publish lock")
+                })?
+                .map_err(LinkedInApiError::Coordination)?;
+            match lease {
+                Some(lease) => break lease,
+                None => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        };
         let store = self.store.clone().ok_or(LinkedInApiError::AccessRequired)?;
         let tokens = tokio::task::spawn_blocking(move || store.load())
             .await
@@ -86,7 +122,6 @@ impl LinkedInClient {
         {
             return Err(LinkedInApiError::AccessRequired);
         }
-        validate_text(text)?;
         let author = self.resolve_author(&tokens).await?;
         let body = json!({
             "author": author.as_str(),
@@ -101,6 +136,20 @@ impl LinkedInClient {
         });
         if is_expired(tokens.expires_at_unix())? {
             return Err(LinkedInApiError::AccessRequired);
+        }
+
+        let confirmation_digest = digest(&SHA256, text.as_bytes())
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 digest has 32 bytes");
+        // Reserve the content before sending and keep the reservation on every
+        // outcome, including a timeout or cancellation during the request.
+        if !CONSUMED_CONFIRMATIONS
+            .lock()
+            .map_err(|_| LinkedInApiError::Coordination("could not reserve publish confirmation"))?
+            .insert((tokens.client_id.clone(), confirmation_digest))
+        {
+            return Err(LinkedInApiError::ConfirmationAlreadyUsed);
         }
 
         let response = self
@@ -138,6 +187,9 @@ impl LinkedInClient {
     }
 
     async fn resolve_author(&self, tokens: &TokenSet) -> Result<String, LinkedInApiError> {
+        let stored_hash = tokens
+            .subject_hash()
+            .ok_or(LinkedInApiError::AccessRequired)?;
         let mut response = self
             .http
             .get(USERINFO_ENDPOINT)
@@ -170,7 +222,27 @@ impl LinkedInClient {
         {
             return Err(LinkedInApiError::InvalidIdentityResponse);
         }
+        let subject_hash = digest(&SHA256, sub.as_bytes());
+        if !bool::from(subject_hash.as_ref().ct_eq(stored_hash)) {
+            return Err(LinkedInApiError::AccessRequired);
+        }
         Ok(format!("urn:li:person:{}", sub.as_str()))
+    }
+}
+
+fn connection_status(store: Option<&TokenStore>, allows_publish_scopes: bool) -> ConnectionStatus {
+    let tokens = store.and_then(|store| store.load().ok().flatten());
+    let subject_hash_present = tokens
+        .as_ref()
+        .is_some_and(|tokens| tokens.subject_hash().is_some());
+    let approved_scopes = tokens.map_or_else(Vec::new, |tokens| tokens.scopes().to_vec());
+    ConnectionStatus {
+        connected: subject_hash_present
+            && allows_publish_scopes
+            && PUBLISH_SCOPES
+                .iter()
+                .all(|scope| approved_scopes.contains(scope)),
+        approved_scopes,
     }
 }
 
@@ -179,7 +251,7 @@ struct UserInfo {
     sub: Zeroizing<String>,
 }
 
-fn validate_text(text: &str) -> Result<(), LinkedInApiError> {
+pub(crate) fn validate_text(text: &str) -> Result<(), LinkedInApiError> {
     if text.encode_utf16().take(MAX_POST_LENGTH + 1).count() > MAX_POST_LENGTH
         || text.trim().is_empty()
         || text

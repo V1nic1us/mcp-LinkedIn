@@ -1,5 +1,3 @@
-#[cfg(target_os = "linux")]
-mod auth_session;
 mod stdio;
 
 use std::{env, error::Error, io, process::ExitCode, sync::Arc};
@@ -8,22 +6,26 @@ use std::{env, error::Error, io, process::ExitCode, sync::Arc};
 use std::process::Stdio;
 
 use async_trait::async_trait;
-use linkedin_mcp::config::AppConfig;
+#[cfg(target_os = "linux")]
+use linkedin_mcp::auth_session;
 #[cfg(target_os = "linux")]
 use linkedin_mcp::linkedin::{oauth::OAuthClient, token_store::TokenStore};
+use linkedin_mcp::{config::AppConfig, tools};
 use rust_mcp_sdk::{
     mcp_server::{server_runtime, McpServerOptions, ServerHandler},
     schema::{
-        Implementation, InitializeRequestParams, InitializeResult, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, RpcError, ServerCapabilities,
-        ServerCapabilitiesTools,
+        schema_utils::CallToolError, CallToolRequestParams, CallToolResult, Implementation,
+        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, RpcError, ServerCapabilities, ServerCapabilitiesTools,
     },
     McpServer, ToMcpServerHandler,
 };
 
 use crate::stdio::{StdioFailure, StdioTransport};
 
-struct LinkedInServer;
+struct LinkedInServer {
+    config: Arc<AppConfig>,
+}
 
 #[async_trait]
 impl ServerHandler for LinkedInServer {
@@ -53,10 +55,18 @@ impl ServerHandler for LinkedInServer {
         _runtime: Arc<dyn McpServer>,
     ) -> Result<ListToolsResult, RpcError> {
         Ok(ListToolsResult {
-            tools: Vec::new(),
+            tools: tools::list(),
             meta: None,
             next_cursor: None,
         })
+    }
+
+    async fn handle_call_tool_request(
+        &self,
+        params: CallToolRequestParams,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<CallToolResult, CallToolError> {
+        tools::call(self.config.clone(), params).await
     }
 }
 
@@ -85,7 +95,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run_server() -> Result<(), Box<dyn Error>> {
-    AppConfig::from_env()?;
+    let config = AppConfig::from_env()?;
 
     tracing_subscriber::fmt()
         .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
@@ -97,7 +107,7 @@ async fn run_server() -> Result<(), Box<dyn Error>> {
         .with_ansi(false)
         .init();
 
-    serve_stdio().await?;
+    serve_stdio(config).await?;
     Ok(())
 }
 
@@ -151,7 +161,7 @@ fn logout() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn serve_stdio() -> Result<(), &'static str> {
+async fn serve_stdio(config: AppConfig) -> Result<(), &'static str> {
     let (transport, mut failures) =
         StdioTransport::open().map_err(|_| "could not start MCP stdio transport")?;
     let server = server_runtime::create_server(McpServerOptions {
@@ -173,7 +183,10 @@ async fn serve_stdio() -> Result<(), &'static str> {
             meta: None,
         },
         transport,
-        handler: LinkedInServer.to_mcp_server_handler(),
+        handler: LinkedInServer {
+            config: Arc::new(config),
+        }
+        .to_mcp_server_handler(),
         task_store: None,
         client_task_store: None,
         message_observer: None,

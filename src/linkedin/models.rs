@@ -20,7 +20,9 @@ pub struct PublishedPost {
 pub enum LinkedInApiError {
     AccessRequired,
     CredentialStore(TokenStoreError),
+    Coordination(&'static str),
     InvalidText,
+    ConfirmationAlreadyUsed,
     Unauthorized,
     RateLimited { retry_after_seconds: Option<u64> },
     Transport,
@@ -36,8 +38,12 @@ impl fmt::Display for LinkedInApiError {
                 "LinkedIn access is required. Enable both LinkedIn products, allow openid and w_member_social, and run auth login.",
             ),
             Self::CredentialStore(error) => fmt::Display::fmt(error, formatter),
+            Self::Coordination(error) => formatter.write_str(error),
             Self::InvalidText => formatter.write_str(
                 "post text must be nonblank and at most 3000 UTF-16 code units, with control characters limited to tabs and line breaks",
+            ),
+            Self::ConfirmationAlreadyUsed => formatter.write_str(
+                "this post confirmation has already been consumed. Check your LinkedIn activity for the outcome of the earlier attempt.",
             ),
             Self::Unauthorized => {
                 formatter.write_str("LinkedIn rejected the credential. Run auth login again.")

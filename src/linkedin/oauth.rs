@@ -9,8 +9,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::{
     digest::{digest, SHA256},
     rand::{SecureRandom, SystemRandom},
+    signature::{RsaPublicKeyComponents, RSA_PKCS1_2048_8192_SHA256},
 };
 use serde::Deserialize;
+use serde_json::Value;
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -26,11 +28,13 @@ use super::{valid_token, ScopeGrant, TokenRecord, TokenSet};
 
 const AUTHORIZE_ENDPOINT: &str = "https://www.linkedin.com/oauth/native-pkce/authorization";
 const TOKEN_ENDPOINT: &str = "https://www.linkedin.com/oauth/v2/accessToken";
+const JWKS_ENDPOINT: &str = "https://www.linkedin.com/oauth/openid/jwks";
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_CALLBACK_BYTES: usize = 8192;
 const MAX_TOKEN_BODY_BYTES: usize = 32768;
+const MAX_JWKS_BODY_BYTES: usize = 65536;
 
 pub struct OAuthClient {
     client_id: String,
@@ -95,6 +99,7 @@ impl OAuthClient {
 
         let state = random_url_safe()?;
         let verifier = random_url_safe()?;
+        let nonce = random_url_safe()?;
         let challenge = URL_SAFE_NO_PAD.encode(digest(&SHA256, verifier.as_bytes()).as_ref());
         let mut url =
             Url::parse(AUTHORIZE_ENDPOINT).expect("fixed LinkedIn authorization endpoint");
@@ -103,6 +108,7 @@ impl OAuthClient {
             .append_pair("client_id", &self.client_id)
             .append_pair("redirect_uri", redirect_uri.as_str())
             .append_pair("scope", &requested_scopes())
+            .append_pair("nonce", &nonce)
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
@@ -114,6 +120,7 @@ impl OAuthClient {
             redirect_uri,
             state,
             verifier,
+            nonce,
             deadline: Instant::now() + CONSENT_TIMEOUT,
         })
     }
@@ -184,12 +191,28 @@ impl OAuthClient {
         {
             return Err(OAuthError::InvalidToken);
         }
+        let id_token = token
+            .id_token
+            .as_deref()
+            .ok_or(OAuthError::MissingIdentityToken)?;
+        let subject = validate_id_token(
+            &self.http,
+            id_token,
+            &self.client_id,
+            callback.nonce.as_str(),
+        )
+        .await?;
+        let subject_hash: [u8; 32] = digest(&SHA256, subject.as_bytes())
+            .as_ref()
+            .try_into()
+            .map_err(|_| OAuthError::InvalidIdentityToken)?;
         Ok(TokenSet {
             client_id: callback.client_id,
             record: TokenRecord {
                 access_token: token.access_token,
                 expires_at_unix,
                 grant: ScopeGrant::OpenIdAndShare,
+                subject_hash: Some(subject_hash),
             },
         })
     }
@@ -199,9 +222,133 @@ impl OAuthClient {
 struct TokenResponse {
     access_token: Zeroizing<String>,
     expires_in: u64,
+    id_token: Option<Zeroizing<String>>,
     // OAuth permits omission when the grant matches the requested scopes.
     #[serde(default = "requested_scopes")]
     scope: String,
+}
+
+async fn validate_id_token(
+    http: &reqwest::Client,
+    token: &str,
+    client_id: &str,
+    nonce: &str,
+) -> Result<String, OAuthError> {
+    let mut sections = token.split('.');
+    let (Some(encoded_header), Some(encoded_claims), Some(encoded_signature), None) = (
+        sections.next(),
+        sections.next(),
+        sections.next(),
+        sections.next(),
+    ) else {
+        return Err(OAuthError::InvalidIdentityToken);
+    };
+    let decode = |part: &str| {
+        URL_SAFE_NO_PAD
+            .decode(part)
+            .map_err(|_| OAuthError::InvalidIdentityToken)
+    };
+    let header: Value = serde_json::from_slice(&decode(encoded_header)?)
+        .map_err(|_| OAuthError::InvalidIdentityToken)?;
+    if header.get("alg").and_then(Value::as_str) != Some("RS256") {
+        return Err(OAuthError::InvalidIdentityToken);
+    }
+    let kid = header
+        .get("kid")
+        .and_then(Value::as_str)
+        .filter(|kid| !kid.is_empty())
+        .ok_or(OAuthError::InvalidIdentityToken)?;
+    let claims: Value = serde_json::from_slice(&decode(encoded_claims)?)
+        .map_err(|_| OAuthError::InvalidIdentityToken)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| OAuthError::InvalidClock)?
+        .as_secs();
+    let valid_audience = claims.get("aud").is_some_and(|audience| match audience {
+        Value::String(value) => value == client_id,
+        Value::Array(items) => items.len() == 1 && items[0].as_str() == Some(client_id),
+        _ => false,
+    });
+    let valid_authorized_party = claims
+        .get("azp")
+        .is_none_or(|authorized_party| authorized_party.as_str() == Some(client_id));
+    let expiration = claims.get("exp").and_then(Value::as_u64);
+    let issued_at = claims.get("iat").and_then(Value::as_u64);
+    let subject = claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|subject| valid_subject(subject))
+        .ok_or(OAuthError::InvalidIdentityToken)?;
+    let claim_nonce = claims.get("nonce").and_then(Value::as_str);
+    if claims.get("iss").and_then(Value::as_str) != Some("https://www.linkedin.com")
+        || !valid_audience
+        || !valid_authorized_party
+        || expiration.is_none_or(|value| value <= now)
+        || issued_at.is_none_or(|value| value > now.saturating_add(60))
+        || expiration
+            .zip(issued_at)
+            .is_none_or(|(exp, iat)| exp <= iat)
+        || claim_nonce.is_none_or(|value| !bool::from(value.as_bytes().ct_eq(nonce.as_bytes())))
+    {
+        return Err(OAuthError::InvalidIdentityToken);
+    }
+
+    let mut response = http
+        .get(JWKS_ENDPOINT)
+        .send()
+        .await
+        .map_err(|_| OAuthError::IdentityKeysUnavailable)?;
+    if !response.status().is_success() {
+        return Err(OAuthError::IdentityKeysUnavailable);
+    }
+    let mut body = Zeroizing::new(Vec::new());
+    while let Some(chunk) = response.chunk().await.map_err(|_| OAuthError::Transport)? {
+        if chunk.len() > MAX_JWKS_BODY_BYTES.saturating_sub(body.len()) {
+            return Err(OAuthError::InvalidIdentityToken);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let keys: Value =
+        serde_json::from_slice(&body).map_err(|_| OAuthError::InvalidIdentityToken)?;
+    let mut matches = keys
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or(OAuthError::InvalidIdentityToken)?
+        .iter()
+        .filter(|key| key.get("kid").and_then(Value::as_str) == Some(kid));
+    let key = matches.next().ok_or(OAuthError::InvalidIdentityToken)?;
+    if matches.next().is_some() || key.get("kty").and_then(Value::as_str) != Some("RSA") {
+        return Err(OAuthError::InvalidIdentityToken);
+    }
+    let modulus = decode(
+        key.get("n")
+            .and_then(Value::as_str)
+            .ok_or(OAuthError::InvalidIdentityToken)?,
+    )?;
+    let exponent = decode(
+        key.get("e")
+            .and_then(Value::as_str)
+            .ok_or(OAuthError::InvalidIdentityToken)?,
+    )?;
+    RsaPublicKeyComponents {
+        n: &modulus,
+        e: &exponent,
+    }
+    .verify(
+        &RSA_PKCS1_2048_8192_SHA256,
+        format!("{encoded_header}.{encoded_claims}").as_bytes(),
+        &decode(encoded_signature)?,
+    )
+    .map_err(|_| OAuthError::InvalidIdentityToken)?;
+    Ok(subject.to_owned())
+}
+
+fn valid_subject(subject: &str) -> bool {
+    !subject.is_empty()
+        && subject.len() <= 255
+        && subject
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn requested_scopes() -> String {
@@ -215,6 +362,7 @@ pub struct PendingAuthorization {
     redirect_uri: Url,
     state: Zeroizing<String>,
     verifier: Zeroizing<String>,
+    nonce: Zeroizing<String>,
     deadline: Instant,
 }
 
@@ -233,6 +381,7 @@ impl PendingAuthorization {
             client_id: self.client_id,
             redirect_uri: self.redirect_uri,
             verifier: self.verifier,
+            nonce: self.nonce,
             deadline: self.deadline,
         })
     }
@@ -369,6 +518,7 @@ pub struct LoopbackCallback {
     client_id: String,
     redirect_uri: Url,
     verifier: Zeroizing<String>,
+    nonce: Zeroizing<String>,
     deadline: Instant,
 }
 
@@ -399,6 +549,9 @@ pub enum OAuthError {
     Transport,
     TokenRejected(u16),
     InvalidToken,
+    MissingIdentityToken,
+    InvalidIdentityToken,
+    IdentityKeysUnavailable,
 }
 
 impl fmt::Display for OAuthError {
@@ -424,6 +577,9 @@ impl fmt::Display for OAuthError {
                 "LinkedIn rejected the token exchange (HTTP {status}); verify the client ID and redirect URI, confirm that LinkedIn Developer Support enabled native PKCE OAuth, and start authorization again"
             ),
             Self::InvalidToken => "LinkedIn returned an invalid access token, scope, or expiration",
+            Self::MissingIdentityToken => "LinkedIn's native PKCE token response omitted the required OpenID Connect ID token; confirm that OIDC ID tokens are enabled for this app and native flow",
+            Self::InvalidIdentityToken => "LinkedIn did not return a valid nonce-bound OpenID Connect ID token; reauthorize after confirming that Sign In with LinkedIn using OpenID Connect is enabled for native PKCE",
+            Self::IdentityKeysUnavailable => "could not validate LinkedIn's OpenID Connect signature because the official signing keys were unavailable",
         };
         formatter.write_str(message)
     }

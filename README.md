@@ -1,10 +1,14 @@
 # LinkedIn MCP
 
 LinkedIn MCP is a local Linux server that speaks MCP over standard input and
-output. The server accepts MCP initialization and advertises an empty tool list.
-You can authorize a LinkedIn app separately from the stdio session.
+output. It lists tools for local profile drafting, connection status, post
+preparation, and confirmed public text publishing. Authorize the LinkedIn app
+separately from the stdio session.
 
 ## Build on Linux
+
+Step-by-step guides: [LinkedIn app setup](docs/linkedin-app-setup.md) and
+[MCP client configuration](docs/client-configuration.md).
 
 Install [Rust and Cargo](https://rustup.rs/) 1.84.0 or newer and your Linux
 distribution's native build tools, `pkg-config`, and D-Bus development headers
@@ -70,6 +74,26 @@ The API client uses `GET /v2/userinfo` to resolve the member and
 `https://api.linkedin.com`. [OpenID Connect](https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/sign-in-with-linkedin-v2)
 [Share on LinkedIn](https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/share-on-linkedin)
 
+The authorization exchange requires a valid nonce-bound OpenID Connect ID
+token signed by LinkedIn. The documented native PKCE response lists an access
+token and expiry, but does not specify whether it issues an ID token. If the
+enabled native flow omits `id_token`, login fails closed and publishing remains
+unavailable until LinkedIn documents or enables OIDC ID tokens for that flow.
+
+## Approve every publish call
+
+Configure the MCP host to show the exact public post preview and require human
+approval for every call to `publish_post`. The deterministic confirmation digest
+binds the preview text, including any appended URL. The server cannot verify
+that a human approved a call. Use only hosts that enforce per-call approval for
+publishing; disable `publish_post` in hosts without that setting.
+
+The server consumes a matching confirmation before sending the POST. Identical
+content for the same app can be attempted once per server process. The registry
+is held in memory, so a restart or a separate server process has its own
+registry. After an uncertain result, check your LinkedIn activity before taking
+any further action. Keep automatic publish retries disabled in the host.
+
 ## Disconnect LinkedIn
 
 Run `./target/release/linkedin-mcp auth logout` with the same
@@ -86,51 +110,6 @@ Permitted Services** in LinkedIn and remove the app. [LinkedIn disconnect steps]
 
 ## Configure each MCP client
 
-Replace `/absolute/path/to/linkedin-mcp` with the full path to the built binary,
-such as `/home/you/src/linkedin-mcp/target/release/linkedin-mcp`.
-
-### Codex
-
-Add the server with the [Codex MCP CLI](https://developers.openai.com/codex/mcp/):
-
-```sh
-codex mcp add linkedin -- /absolute/path/to/linkedin-mcp
-```
-
-The equivalent entry in `~/.codex/config.toml` is:
-
-```toml
-[mcp_servers.linkedin]
-command = "/absolute/path/to/linkedin-mcp"
-args = []
-```
-
-### Claude Code
-
-Register the executable as a [local stdio server](https://code.claude.com/docs/en/mcp):
-
-```sh
-claude mcp add --transport stdio linkedin -- /absolute/path/to/linkedin-mcp
-```
-
-### Claude Desktop and other stdio clients
-
-For clients that accept a local `mcpServers` configuration, including editions of
-[Claude Desktop](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop)
-that accept manual entries in `claude_desktop_config.json`, add this entry to
-the client's configuration and restart the client:
-
-```json
-{
-  "mcpServers": {
-    "linkedin": {
-      "command": "/absolute/path/to/linkedin-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-Clients with a different configuration format can use the same executable path
-and empty argument list. Compatibility requires local stdio transport and support
-for the MCP initialization handshake through protocol version `2025-11-25`.
+Use the [client configuration guide](docs/client-configuration.md) for Codex,
+Claude Code, Grok CLI, Google Antigravity, and other local stdio clients. It
+shows the required environment settings and per-call publishing approval rule.

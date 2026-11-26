@@ -31,6 +31,10 @@ impl TokenSet {
             ScopeGrant::OpenIdAndShare => &PUBLISH_SCOPES,
         }
     }
+
+    pub(crate) fn subject_hash(&self) -> Option<&[u8; 32]> {
+        self.record.subject_hash.as_ref()
+    }
 }
 
 impl fmt::Debug for TokenSet {
@@ -51,6 +55,8 @@ struct TokenRecord {
     expires_at_unix: u64,
     #[serde(default)]
     grant: ScopeGrant,
+    #[serde(default)]
+    subject_hash: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]

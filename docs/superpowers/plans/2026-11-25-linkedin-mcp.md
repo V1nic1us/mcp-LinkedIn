@@ -90,6 +90,8 @@
 - Produces `LinkedInClient::connection_status() -> ConnectionStatus` and async `LinkedInClient::create_text_post(text: &str) -> Result<PublishedPost, LinkedInApiError>`.
 - `PublishedPost` contains the returned post URN and an optional URL. `ConnectionStatus` contains local connected state and approved scopes.
 - Resolve the authenticated member with `GET https://api.linkedin.com/v2/userinfo` using the OAuth bearer token. Consume only `sub` and construct `urn:li:person:{sub}` locally.
+- Generate an authorization nonce and require a valid RS256 ID token from the authorization code exchange. Validate the signature against the fixed LinkedIn JWKS URI, `iss`, `aud`, `exp`, `iat`, `nonce`, and `sub`. Store only SHA-256(`sub`) beside the token. Require UserInfo `sub` to match that hash before posting. If native PKCE omits an ID token, fail closed and document the provider blocker.
+- Acquire the shared per-app v2 coordination lock before loading the keyring token. Hold its lease through UserInfo validation and the post request so logout and publish serialize.
 - Publish exclusively through the [Share on LinkedIn consumer endpoint](https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/share-on-linkedin), `POST /v2/ugcPosts` on `https://api.linkedin.com`, with `X-Restli-Protocol-Version: 2.0.0`. Use the text-only `ShareContent` shape and explicit `PUBLIC` visibility. This endpoint uses the Share on LinkedIn product and `w_member_social`.
 
 - [ ] Implement a Reqwest client with fixed HTTPS endpoints, bearer authentication, timeouts, and redirects and retries disabled.
@@ -103,7 +105,7 @@
 - Create: `src/tools/profile.rs`
 - Create: `src/tools/status.rs`
 - Create: `src/tools/mod.rs`
-- Modify: `src/main.rs`
+- Modify: `src/lib.rs`, `src/main.rs`, `src/linkedin/client.rs`
 - Test: `tests/profile_tools.rs`
 - Test: `tests/status_tool.rs`
 
@@ -114,10 +116,13 @@
 
 - [ ] Test supported field validation, empty/oversized content, result includes official profile URL, and tool has no LinkedIn HTTP side effect.
 - [ ] Run `cargo test --test profile_tools --test status_tool`; expect missing tool/validation failures.
-- [ ] Implement profile draft tool as local transformation/formatting only; do not claim profile update succeeded.
-- [ ] Implement connection status using the token store and approved-scope metadata without exposing credentials.
-- [ ] Register both tools with MCP and test schemas and responses through the protocol harness.
+- [x] Implement profile draft tool as local transformation/formatting only; do not claim profile update succeeded.
+- [x] Implement connection status using the token store and approved-scope metadata without exposing credentials.
+- [x] Register both tools with MCP and statically review the request schemas and result serialization.
+- [ ] Verify schemas and responses through the protocol harness.
 - [ ] Run `cargo test --test profile_tools --test status_tool`; expect tool validation and no-network assertions to pass.
+
+Test authoring and execution were deferred under the static-only instruction. See the Task 4 report in the local SDD workspace.
 
 ### Task 5: Add reviewed post preparation and confirmed publishing
 
@@ -131,14 +136,18 @@
 **Interfaces:**
 - Produces MCP tool `prepare_post(text: String, url: Option<String>) -> PreparedPost`.
 - Produces MCP tool `publish_post(text: String, confirmation: String) -> PublishResult`.
-- `publish_post` accepts only an exact confirmation string derived from the exact content, for example `PUBLISH:` followed by a SHA-256 digest of the normalized text and optional URL. Server computes the expected confirmation and returns it from `prepare_post`; publishing is rejected if confirmation is absent or mismatched.
+- `prepare_post` trims the text and normalizes line endings. An optional HTTP(S) URL is serialized and appended as plain text after a blank line. The returned `text` is the exact commentary sent to LinkedIn.
+- `publish_post` requires the verbatim preview and `PUBLISH:` followed by the lowercase hexadecimal SHA-256 digest of its UTF-8 bytes. The MCP host obtains explicit user approval before passing the digest. The server checks the content binding before accessing the publishing client and atomically consumes each confirmation before the POST. The process-wide registry is scoped by app and content and resets on restart. The digest alone cannot establish human approval.
 
 - [ ] Test preview normalization, exact confirmation success, missing/mismatched confirmation, no scope/no credentials, successful post, and ambiguous timeout with no retry.
 - [ ] Run `cargo test --test post_tools --test publish_safety`; expect tests to fail before implementation.
-- [ ] Implement deterministic preview and confirmation digest over the exact serialized content that the API client will submit.
-- [ ] Implement the publish tool so the only write path invokes `LinkedInClient::create_text_post` after validating confirmation and scope.
-- [ ] Ensure the MCP client receives a clear access/setup error when the official product or scope is missing; never substitute browser automation.
+- [x] Implement deterministic preview and confirmation digest over the exact serialized content that the API client will submit.
+- [x] Implement the publish tool so the only write path invokes `LinkedInClient::create_text_post` after validating confirmation and scope.
+- [x] Ensure the MCP client receives a clear access/setup error when the official product or scope is missing; never substitute browser automation.
+- [x] Advertise publishing as destructive and non-idempotent, document the per-call host approval requirement, and advertise closed argument schemas.
 - [ ] Run `cargo test --test post_tools --test publish_safety`; expect all confirmation binding and no-write cases to pass.
+
+Test authoring and execution were deferred under the static-only instruction. See the Task 5 report in the local SDD workspace.
 
 ### Task 6: Finish operations documentation and end-to-end verification
 
@@ -156,4 +165,6 @@
 - [ ] Run `cargo test`; expect all unit, integration, and protocol tests to pass.
 - [ ] Run `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`; fix formatting and lint findings.
 - [ ] Review docs and error paths for accidental token/content logging; add a regression assertion that captured logs do not contain the fixture token.
-- [ ] Document the requirement for both app products and granted scopes. Describe a manual account-level smoke check the user can perform after configuring credentials.
+- [x] Document the requirement for both app products and granted scopes. Describe a manual account-level smoke check the user can perform after configuring credentials.
+
+Task 6 test/build/lint commands were not run under the static-only instruction. The provider's native PKCE ID-token support remains an external prerequisite.

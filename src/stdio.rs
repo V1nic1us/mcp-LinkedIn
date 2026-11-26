@@ -9,8 +9,8 @@ use std::{
 use async_trait::async_trait;
 use rust_mcp_sdk::{
     schema::{
-        ClientMessage, ClientMessages, MessageFromServer, RequestId, SdkError, ServerMessage,
-        ServerMessages,
+        ClientMessage, ClientMessages, MessageFromServer, RequestId, Result as McpResult,
+        ResultFromServer, SdkError, ServerMessage, ServerMessages,
     },
     IoStream, McpDispatch, MessageDispatcher, Transport, TransportDispatcher, TransportError,
     TransportOptions, TransportResult,
@@ -218,13 +218,57 @@ impl Transport<ClientMessages, MessageFromServer, ClientMessage, ServerMessages,
     }
 }
 
+// The pinned SDK's ToolInputSchema omits additionalProperties. Keep its
+// typed list result until dispatch, then preserve the keyword on the wire.
+fn close_tool_input_schemas(message: &mut ServerMessage) -> TransportResult<()> {
+    let ServerMessage::Response(response) = message else {
+        return Ok(());
+    };
+    let ResultFromServer::ListToolsResult(list) = &response.result else {
+        return Ok(());
+    };
+    let schema_error = || TransportError::Internal("could not serialize MCP tool schemas".into());
+    let serde_json::Value::Object(mut fields) =
+        serde_json::to_value(list).map_err(|_| schema_error())?
+    else {
+        return Err(schema_error());
+    };
+    let tools = fields
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(schema_error)?;
+    for tool in tools {
+        let input = tool
+            .get_mut("inputSchema")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(schema_error)?;
+        input.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
+    }
+    response.result = ResultFromServer::Result(McpResult {
+        meta: None,
+        extra: Some(fields),
+    });
+    Ok(())
+}
+
 #[async_trait]
 impl McpDispatch<ClientMessages, ServerMessages, ClientMessage, ServerMessage> for StdioTransport {
     async fn send_message(
         &self,
-        message: ServerMessages,
+        mut message: ServerMessages,
         timeout: Option<Duration>,
     ) -> TransportResult<Option<ClientMessages>> {
+        match &mut message {
+            ServerMessages::Single(message) => close_tool_input_schemas(message)?,
+            ServerMessages::Batch(messages) => {
+                for message in messages {
+                    close_tool_input_schemas(message)?;
+                }
+            }
+        }
         self.dispatcher()
             .await?
             .send_message(message, timeout)

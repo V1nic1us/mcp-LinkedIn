@@ -1,10 +1,10 @@
 use std::{env, error::Error, fs::File, os::unix::fs::FileExt, path::Path};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use linkedin_mcp::{
+use crate::{
     config::AppConfig,
     linkedin::{token_store::TokenStore, TokenSet},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ring::digest::{digest, SHA256};
 use rustix::{
     fs::{self, FileType, FlockOperation, Mode, OFlags},
@@ -24,20 +24,21 @@ const LOGOUT_PENDING: &str =
     "a previous LinkedIn logout was interrupted; run auth logout again to complete it";
 
 /// Linux's monotonic clock has the same origin in both CLI processes.
-pub(super) fn monotonic_now() -> i128 {
+pub fn monotonic_now() -> i128 {
     let now = clock_gettime(ClockId::Monotonic);
     i128::from(now.tv_sec) * 1_000_000_000 + i128::from(now.tv_nsec)
 }
 
 /// The state file stays unlocked during browser consent.
-pub(super) struct AuthSession {
+pub struct AuthSession {
     state: File,
     dir: File,
+    state_name: String,
     legacy_name: String,
 }
 
 impl AuthSession {
-    pub(super) fn open(config: &AppConfig) -> Result<Self, &'static str> {
+    pub fn open(config: &AppConfig) -> Result<Self, &'static str> {
         let client_id = config
             .linkedin_client_id
             .as_deref()
@@ -61,14 +62,16 @@ impl AuthSession {
 
         let app = URL_SAFE_NO_PAD.encode(digest(&SHA256, client_id.as_bytes()).as_ref());
         let dir = File::from(dir);
+        let state_name = format!("linkedin-mcp-auth-v2-{app}");
         Ok(Self {
-            state: open_file(&dir, &format!("linkedin-mcp-auth-v2-{app}"))?,
+            state: open_file(&dir, &state_name)?,
             dir,
+            state_name,
             legacy_name: format!("linkedin-mcp-auth-{app}"),
         })
     }
 
-    pub(super) fn save(
+    pub fn save(
         self,
         store: &TokenStore,
         tokens: &TokenSet,
@@ -90,7 +93,24 @@ impl AuthSession {
         Ok(())
     }
 
-    pub(super) fn logout(self, store: &TokenStore) -> Result<(), Box<dyn Error>> {
+    pub fn try_acquire_publish_lease(&self) -> Result<Option<PublishLease>, &'static str> {
+        let state = open_file(&self.dir, &self.state_name)?;
+        let Some(len) = try_lock(&state)? else {
+            return Ok(None);
+        };
+        if matches!(
+            read_state(&state, len)?,
+            Some(StateRecord {
+                status: PENDING,
+                ..
+            })
+        ) {
+            return Err(LOGOUT_PENDING);
+        }
+        Ok(Some(PublishLease { _state: state }))
+    }
+
+    pub fn logout(self, store: &TokenStore) -> Result<(), Box<dyn Error>> {
         // All two-file operations lock v2 first, then legacy, through completion.
         lock(&self.state)?;
         let legacy = open_file(&self.dir, &self.legacy_name)?;
@@ -122,6 +142,11 @@ impl AuthSession {
     }
 }
 
+pub struct PublishLease {
+    // Closing this descriptor releases the same flock that logout acquires.
+    _state: File,
+}
+
 fn open_file(dir: &File, name: &str) -> Result<File, &'static str> {
     let file = fs::openat(
         dir,
@@ -144,6 +169,25 @@ fn lock(file: &File) -> Result<u64, &'static str> {
         return Err(RUNTIME_ERROR);
     }
     u64::try_from(info.st_size).map_err(|_| RUNTIME_ERROR)
+}
+
+fn try_lock(file: &File) -> Result<Option<u64>, &'static str> {
+    match fs::flock(file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(_) => return Err(RUNTIME_ERROR),
+    }
+    let info = fs::fstat(file).map_err(|_| RUNTIME_ERROR)?;
+    if FileType::from_raw_mode(info.st_mode) != FileType::RegularFile
+        || info.st_uid != geteuid().as_raw()
+        || info.st_mode & 0o077 != 0
+        || info.st_nlink != 1
+    {
+        return Err(RUNTIME_ERROR);
+    }
+    Ok(Some(
+        u64::try_from(info.st_size).map_err(|_| RUNTIME_ERROR)?,
+    ))
 }
 
 #[derive(Clone, Copy)]
