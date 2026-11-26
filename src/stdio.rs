@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{self, BufRead, Read, Write},
-    sync::Arc,
+    sync::{mpsc as std_mpsc, Arc},
     thread,
     time::Duration,
 };
@@ -20,6 +20,8 @@ use tokio::{
     task::{AbortHandle, JoinHandle},
 };
 use tokio_stream::wrappers::ReceiverStream;
+
+const INPUT_DIAGNOSTIC_CAPACITY: usize = 16;
 
 pub(crate) enum StdioFailure {
     Read,
@@ -66,10 +68,29 @@ impl StdioTransport {
                 }
             })?;
 
+        let (diagnostics, diagnostic_rx) =
+            std_mpsc::sync_channel::<&'static str>(INPUT_DIAGNOSTIC_CAPACITY);
+        thread::Builder::new()
+            .name("mcp-input-diagnostics".into())
+            .spawn(move || {
+                for message in diagnostic_rx {
+                    if writeln!(io::stderr().lock(), "linkedin-mcp: {message}").is_err() {
+                        break;
+                    }
+                }
+            })?;
+
         thread::Builder::new()
             .name("mcp-stdin".into())
             .spawn(move || {
-                if read_frames(io::stdin().lock(), &read_tx, options.max_line_length).is_err() {
+                if read_frames(
+                    io::stdin().lock(),
+                    &read_tx,
+                    &diagnostics,
+                    options.max_line_length,
+                )
+                .is_err()
+                {
                     let _ = failure_tx.send(StdioFailure::Read);
                 }
             })?;
@@ -110,6 +131,7 @@ impl StdioTransport {
 fn read_frames(
     mut input: impl BufRead,
     sender: &mpsc::Sender<ClientMessages>,
+    diagnostics: &std_mpsc::SyncSender<&'static str>,
     max_length: usize,
 ) -> io::Result<()> {
     let mut frame = Vec::new();
@@ -120,7 +142,8 @@ fn read_frames(
             return Ok(());
         }
         if frame.len() > max_length && !frame.ends_with(b"\n") {
-            report_input_problem("discarded oversized MCP frame on stdin");
+            // Drop the diagnostic if stderr cannot keep up.
+            let _ = diagnostics.try_send("discarded oversized MCP frame on stdin");
             input.skip_until(b'\n')?;
             continue;
         }
@@ -130,13 +153,11 @@ fn read_frames(
                     return Ok(());
                 }
             }
-            Err(_) => report_input_problem("discarded malformed MCP frame on stdin"),
+            Err(_) => {
+                let _ = diagnostics.try_send("discarded malformed MCP frame on stdin");
+            }
         }
     }
-}
-
-fn report_input_problem(message: &str) {
-    let _ = writeln!(io::stderr().lock(), "linkedin-mcp: {message}");
 }
 
 #[async_trait]
