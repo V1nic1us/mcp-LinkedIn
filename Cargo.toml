@@ -6,6 +6,8 @@ rust-version = "1.84"
 
 [dependencies]
 async-trait = "0.1"
-rust-mcp-sdk = { version = "=1.1.0", default-features = false, features = ["server", "stdio"] }
-tokio = { version = "1", features = ["macros", "rt"] }
+rust-mcp-sdk = { version = "=1.1.0", default-features = false, features = ["server"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "macros", "rt", "sync"] }
+tokio-stream = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
