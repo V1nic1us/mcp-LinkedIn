@@ -1,14 +1,15 @@
 # LinkedIn MCP
 
 LinkedIn MCP is a local Linux server that speaks MCP over standard input and
-output. The initial server accepts MCP initialization and advertises an empty
-tool list. LinkedIn credentials are unnecessary for this stage.
+output. The server accepts MCP initialization and advertises an empty tool list.
+You can authorize a LinkedIn app separately from the stdio session.
 
 ## Build on Linux
 
 Install [Rust and Cargo](https://rustup.rs/) 1.84.0 or newer and your Linux
-distribution's native build tools (for example, `build-essential` on Debian or
-Ubuntu). From the repository root, build and run the release binary:
+distribution's native build tools, `pkg-config`, and D-Bus development headers
+(`build-essential pkg-config libdbus-1-dev` on Debian or Ubuntu). Build and run
+the release binary from the repository root.
 
 ```sh
 cargo build --locked --release
@@ -23,13 +24,48 @@ the input stream. Stdout carries MCP messages and stderr carries diagnostics.
 | Variable | Value |
 | --- | --- |
 | `LINKEDIN_CLIENT_ID` | LinkedIn application client ID. |
-| `LINKEDIN_REDIRECT_URI` | OAuth redirect URI registered with the LinkedIn app. |
-| `LINKEDIN_ALLOWED_SCOPES` | Space-separated scope allowlist. Defaults to an empty list. |
+| `LINKEDIN_REDIRECT_URI` | Exact OAuth callback URI for the LinkedIn app, using `http://127.0.0.1` or `http://[::1]` with an explicit port above 1023 and a simple path. |
+| `LINKEDIN_ALLOWED_SCOPES` | Space-separated scope allowlist. Set to `w_member_social` for login. This is the only supported scope. |
 | `LINKEDIN_API_VERSION` | LinkedIn API version to use when API calls are added. |
 
-The server loads these settings at startup. Omit an unused variable
-entirely. A blank value or invalid UTF-8 causes a startup error that names the
-variable. OAuth and LinkedIn API calls are planned for later tasks.
+The server loads and validates these settings at startup. All four variables
+can be omitted for a stdio session. A blank value or invalid UTF-8 causes a
+startup error that names the variable.
+
+## Authorize a LinkedIn app on Linux
+
+1. Create or select an app in the [LinkedIn Developer Portal](https://www.linkedin.com/developers/apps).
+   Add **Share on LinkedIn** in the app's **Products** tab to obtain
+   `w_member_social`. [Share on LinkedIn setup](https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/share-on-linkedin)
+2. Ask LinkedIn Developer Support or your LinkedIn contact to enable **native
+   PKCE OAuth** for the app. Wait for confirmation before attempting consent.
+   In the app's **Auth** settings, copy its client ID and register the loopback
+   callback URI, for example `http://127.0.0.1:8765/callback`. Use the same
+   scheme, IP, port, and path in your environment. Supply the public client ID
+   only. The app generates its own per-attempt PKCE verifier. [LinkedIn native OAuth setup](https://learn.microsoft.com/en-us/linkedin/shared/authentication/authorization-code-flow-native)
+3. From your Linux desktop session, make sure `xdg-open` and an unlocked
+   Secret Service keyring are available. Run the commands below, then review
+   and approve the requested permission in your default browser.
+
+```sh
+export LINKEDIN_CLIENT_ID=your_app_client_id
+export LINKEDIN_REDIRECT_URI=http://127.0.0.1:8765/callback
+export LINKEDIN_ALLOWED_SCOPES=w_member_social
+./target/release/linkedin-mcp auth login
+```
+
+The callback listener opens on the configured loopback address for up to five
+minutes. The terminal reports success once the token is saved in the OS
+keyring. An unavailable keyring produces an error. Run `auth login` again to
+renew an expired credential.
+
+## Disconnect LinkedIn
+
+Run `./target/release/linkedin-mcp auth logout` with the same
+`LINKEDIN_CLIENT_ID` to delete the local credential. You can also remove the
+`linkedin-mcp` entry for that client ID in your desktop keyring manager.
+To revoke the app's LinkedIn access, open **Settings & Privacy → Data privacy →
+Permitted Services** in LinkedIn and remove the app. [LinkedIn disconnect steps](https://www.linkedin.com/help/linkedin/answer/a521848/)
 
 ## Configure each MCP client
 

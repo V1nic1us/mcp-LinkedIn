@@ -1,9 +1,18 @@
 mod stdio;
 
-use std::{io, process::ExitCode, sync::Arc};
+use std::{
+    env,
+    error::Error,
+    io,
+    process::{ExitCode, Stdio},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use linkedin_mcp::config::AppConfig;
+use linkedin_mcp::{
+    config::AppConfig,
+    linkedin::{oauth::OAuthClient, token_store::TokenStore},
+};
 use rust_mcp_sdk::{
     mcp_server::{server_runtime, McpServerOptions, ServerHandler},
     schema::{
@@ -55,10 +64,24 @@ impl ServerHandler for LinkedInServer {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    if let Err(error) = AppConfig::from_env() {
-        eprintln!("linkedin-mcp: {error}");
-        return ExitCode::FAILURE;
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    let result = match args.as_slice() {
+        [] => run_server().await,
+        [auth, command] if auth == "auth" && command == "login" => login().await,
+        [auth, command] if auth == "auth" && command == "logout" => logout(),
+        _ => Err("usage: linkedin-mcp [auth login|auth logout]".into()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("linkedin-mcp: {error}");
+            ExitCode::FAILURE
+        }
     }
+}
+
+async fn run_server() -> Result<(), Box<dyn Error>> {
+    AppConfig::from_env()?;
 
     tracing_subscriber::fmt()
         .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
@@ -70,13 +93,53 @@ async fn main() -> ExitCode {
         .with_ansi(false)
         .init();
 
-    match serve_stdio().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("linkedin-mcp: {message}");
-            ExitCode::FAILURE
+    serve_stdio().await?;
+    Ok(())
+}
+
+async fn login() -> Result<(), Box<dyn Error>> {
+    let config = AppConfig::from_env()?;
+    let oauth = OAuthClient::new(&config)?;
+    let store = TokenStore::new(&config)?;
+    // Check keyring access before opening the browser.
+    drop(store.load()?);
+    let pending = oauth.authorize_url().await?;
+
+    // The consent URL goes directly to the OS launcher. Suppress its output
+    // because a launcher can include the URL in its own error messages.
+    const BROWSER_ERROR: &str =
+        "could not open the default browser; run auth login from a Linux desktop session with xdg-open";
+    let mut browser = tokio::process::Command::new("xdg-open")
+        .arg(pending.url().as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| BROWSER_ERROR)?;
+
+    eprintln!("linkedin-mcp: complete LinkedIn consent in your browser");
+    let callback = pending.wait_for_callback();
+    tokio::pin!(callback);
+    let callback = tokio::select! {
+        result = &mut callback => result?,
+        result = browser.wait() => {
+            if !result.map_err(|_| BROWSER_ERROR)?.success() {
+                return Err(BROWSER_ERROR.into());
+            }
+            callback.await?
         }
-    }
+    };
+    let tokens = oauth.exchange_code(callback).await?;
+    store.save(&tokens)?;
+    eprintln!("linkedin-mcp: LinkedIn credential saved in the OS keyring");
+    Ok(())
+}
+
+fn logout() -> Result<(), Box<dyn Error>> {
+    let config = AppConfig::from_env()?;
+    TokenStore::new(&config)?.delete()?;
+    eprintln!("linkedin-mcp: local LinkedIn credential cleared");
+    Ok(())
 }
 
 async fn serve_stdio() -> Result<(), &'static str> {
